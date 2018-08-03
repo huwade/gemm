@@ -6,7 +6,7 @@
 #include <iostream>
 #include <memory>
 #include <bits/stdc++.h>
-
+#include <stdlib.h>     /* malloc, free, rand */
 
 
 struct ResultStats {

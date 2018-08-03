@@ -5,31 +5,35 @@
 #include <iostream>
 #include <memory>
 #include <bits/stdc++.h>
+#include <stdlib.h>     /* malloc, free, rand */
+
+
 
 enum Padding {
   VALID = 1,  // No padding.
   SAME = 2,   // Input and output layers have the same size.
 };
 
+const size_t kMaxChunkSize = (16 * 1024 * 1024);
 
 
-class OpKernelContext;
 
 
-// Used to keep track of persistent memory buffers used within the op.
-// It uses malloc and free to avoid the time cost of initializing the memory.
+
 template <class T, size_t size>
-struct Im2ColBufferResource : public ResourceBase {
-  Im2ColBufferResource<T, size>() {
-    data = static_cast<T*>(port::Malloc(size * sizeof(T)));
+struct Im2ColBufferResource 
+{
+  Im2ColBufferResource<T, size>() 
+  {
+    data = static_cast<T*>(malloc(size * sizeof(T)));
   }
-  ~Im2ColBufferResource<T, size>() { port::Free(data); }
+  ~Im2ColBufferResource<T, size>() { free(data); }
   // This mutex ensures that only a single operation at a time is able to use
   // the buffer memory held by this resource.
-  
+    
   //mutex mu;
   T* data;
-  string DebugString() { return "Im2ColBufferResource"; }
+  //string DebugString() { return "Im2ColBufferResource"; }
 };
 
 // With that in mind, I've avoided using anything except pretty standard C++
@@ -41,15 +45,15 @@ struct Im2ColBufferResource : public ResourceBase {
 // input_data = [input_batches, input_height, input_width, input_depth]
 // filter_data = [filter_height, filter_width, input_depth, filter_count]
 // output_data = [input_batches, output_height, output_width, filter_count]
-template <class T1, class T2, class T3>
+
 class ReferenceConvFunctor 
 {
- public:
-  void operator()(const T1* input_data,
+ public: 
+  void operator()(const int* input_data,
                   int input_batches, int input_height, int input_width,
-                  int input_depth, const T2* filter_data, int filter_height,
+                  int input_depth, const int* filter_data, int filter_height,
                   int filter_width, int filter_count, int stride_rows,
-                  int stride_cols, Padding padding, T3* output_data,
+                  int stride_cols, Padding padding, int* output_data,
                   int output_height, int output_width) {
     // The two different padding modes we support can be a bit confusing. SAME
     // means we're trying to produce an output image that's the same size as the
@@ -111,14 +115,14 @@ class ReferenceConvFunctor
             */
             const int in_x_origin = (out_x * stride_cols) - filter_left_offset;
             const int in_y_origin = (out_y * stride_rows) - filter_top_offset;
-            T3 total(0);
+            int total(0);
             for (int filter_y = 0; filter_y < filter_height; ++filter_y) {
               for (int filter_x = 0; filter_x < filter_width; ++filter_x) {
                 for (int in_channel = 0; in_channel < input_depth;
                      ++in_channel) {
                   const int in_x = in_x_origin + filter_x;
                   const int in_y = in_y_origin + filter_y;
-                  T1 input_value;
+                  int input_value;
                   // If the location is outside the bounds of the input image,
                   // use zero as a default value.
                   if ((in_x >= 0) && (in_x < input_width) && (in_y >= 0) &&
@@ -129,9 +133,9 @@ class ReferenceConvFunctor
                                    (in_y * input_width * input_depth) +
                                    (in_x * input_depth) + in_channel];
                   } else {
-                    input_value = T1(0);
+                    input_value = int(0);
                   }
-                  const T2 filter_value =
+                  const int filter_value =
                       filter_data[(filter_y * filter_width * input_depth *
                                    filter_count) +
                                   (filter_x * input_depth * filter_count) +
@@ -154,15 +158,15 @@ class ReferenceConvFunctor
 // Implements convolution as a two stage process, first packing the patches of
 // the input image into columns (im2col) and then running GEMM to produce the
 // final result.
-template <class T1, class T2, class T3, class TGemmFunctor>
-class Im2ColConvFunctor {
- public:
-  void operator()(OpKernelContext* context, const T1* input_data,
-                  int input_batches, int input_height, int input_width,
-                  int input_depth, const T2* filter_data, int filter_height,
+
+
+void Im2ColConvFunctor (const int* input_data, int input_batches, 
+                  int input_height, int input_width,
+                  int input_depth, const int* filter_data, int filter_height,
                   int filter_width, int filter_count, int stride_rows,
-                  int stride_cols, Padding padding, T3* output_data,
-                  int output_height, int output_width) {
+                  int stride_cols, Padding padding, int* output_data,
+                  int output_height, int output_width) 
+{
    
 
     
@@ -200,61 +204,49 @@ class Im2ColConvFunctor {
     // image world if it helps to visualize it.
     const int filter_value_count = filter_width * filter_height * input_depth;
 
-    const int64 patches_per_chunk =
-        kMaxChunkSize / (filter_value_count * sizeof(T1));
+    const int patches_per_chunk =
+        kMaxChunkSize / (filter_value_count * sizeof(int));
 
-    const int64 chunk_value_count =
-        (kMaxChunkSize + (sizeof(T1) - 1)) / sizeof(T1);
+    const int chunk_value_count =
+        (kMaxChunkSize + (sizeof(int) - 1)) / sizeof(int);
     // Because memory allocation is very expensive on mobile platforms, try to
     // allocate a persistent buffer that will be kept around between calls. We
     // use TensorFlow's resource management to ensure that the memory will be
     // released when the session is over.
-    Im2ColBufferResource<T1, chunk_value_count>* im2col_buffer_resource;
+    Im2ColBufferResource<int, chunk_value_count>* im2col_buffer_resource;
     
-    std::function<Status(Im2ColBufferResource<T1, chunk_value_count>**)>
-        creator = [](Im2ColBufferResource<T1, chunk_value_count>** resource) {
-          *resource = new Im2ColBufferResource<T1, chunk_value_count>();
-          return Status::OK();
-        };
 
-    // This means that multiple ops can't be run simultaneously on different
-    // threads, because we have a single shared resource. The platforms this is
-    // aimed at have intra-op parallelism as their focus though, so it shouldn't
-    // be an issue.
-    
-    //mutex_lock lock_buffer(im2col_buffer_resource->mu); ?? can I comment this ?
-    core::ScopedUnref unref_buffer(im2col_buffer_resource);
-    T1* im2col_buffer = im2col_buffer_resource->data;
+    int* im2col_buffer = im2col_buffer_resource->data;
 
-    const int64 patch_count = (input_batches * output_height * output_width);
-    const int64 chunk_count =
+    const int patch_count = (input_batches * output_height * output_width);
+    const int chunk_count =
         (patch_count + (patches_per_chunk - 1)) / patches_per_chunk;
-    for (int64 chunk_index = 0; chunk_index < chunk_count; ++chunk_index) {
-      const int64 patch_index_start = chunk_index * patches_per_chunk;
-      const int64 patch_index_end =
+    for (int chunk_index = 0; chunk_index < chunk_count; ++chunk_index) {
+      const int patch_index_start = chunk_index * patches_per_chunk;
+      const int patch_index_end =
           std::min(patch_index_start + patches_per_chunk, patch_count);
-      for (int64 patch_index = patch_index_start; patch_index < patch_index_end;
+      for (int patch_index = patch_index_start; patch_index < patch_index_end;
            ++patch_index) {
-        const int64 batch = patch_index / (output_height * output_width);
-        const int64 out_y = (patch_index / output_width) % output_height;
-        const int64 out_x = patch_index % output_width;
-        const T1* input_batch_start =
+        const int batch = patch_index / (output_height * output_width);
+        const int out_y = (patch_index / output_width) % output_height;
+        const int out_x = patch_index % output_width;
+        const int* input_batch_start =
             input_data + (batch * input_height * input_width * input_depth);
         const int in_y_origin = (out_y * stride_rows) - filter_top_offset;
         const int in_x_origin = (out_x * stride_cols) - filter_left_offset;
         const int patch_index_within_chunk = patch_index % patches_per_chunk;
-        T1* im2col_patch_start =
+        int* im2col_patch_start =
             im2col_buffer + (patch_index_within_chunk * filter_value_count);
         for (int filter_y = 0; filter_y < filter_height; ++filter_y) {
           const int in_y = in_y_origin + filter_y;
-          T1* im2col_row_start =
+          int* im2col_row_start =
               im2col_patch_start + (filter_y * filter_width * input_depth);
           // If we're off the top or the bottom of the input, fill the
           // whole row with zeroes.
           if ((in_y < 0) || (in_y >= input_height)) {
-            T1* im2col_row_end =
+            int* im2col_row_end =
                 im2col_row_start + (filter_width * input_depth);
-            std::fill(im2col_row_start, im2col_row_end, T1(0));
+            std::fill(im2col_row_start, im2col_row_end, int(0));
           } else {
             // What we're doing here is trying to copy and fill the im2col
             // buffer as efficiently as possible, using functions to set or
@@ -279,28 +271,28 @@ class Im2ColConvFunctor {
             const int center_copy_count =
                 filter_width - (left_zero_count + right_zero_count);
             if (left_zero_count > 0) {
-              T1* im2col_left_start = im2col_row_start;
-              T1* im2col_left_end =
+              int* im2col_left_start = im2col_row_start;
+              int* im2col_left_end =
                   im2col_left_start + (left_zero_count * input_depth);
-              std::fill(im2col_left_start, im2col_left_end, T1(0));
+              std::fill(im2col_left_start, im2col_left_end, int(0));
             }
             if (center_copy_count > 0) {
-              const T1* input_row_start =
+              const int* input_row_start =
                   input_batch_start + (in_y * input_width * input_depth) +
                   (std::max(0, in_x_origin) * input_depth);
-              const T1* input_row_end =
+              const int* input_row_end =
                   input_row_start + (center_copy_count * input_depth);
-              T1* im2col_center_start =
+              int* im2col_center_start =
                   im2col_row_start + (left_zero_count * input_depth);
               std::copy(input_row_start, input_row_end, im2col_center_start);
             }
             if (right_zero_count > 0) {
-              T1* im2col_right_start =
+              int* im2col_right_start =
                   im2col_row_start +
                   ((left_zero_count + center_copy_count) * input_depth);
-              T1* im2col_right_end =
+              int* im2col_right_end =
                   im2col_right_start + (right_zero_count * input_depth);
-              std::fill(im2col_right_start, im2col_right_end, T1(0));
+              std::fill(im2col_right_start, im2col_right_end, int(0));
             }
           }
         }
@@ -316,21 +308,13 @@ class Im2ColConvFunctor {
       const int ldb = filter_count;
       const int ldc = filter_count;
       
-      T3* chunk_output_data = output_data + (patch_index_start * filter_count);
+      int* chunk_output_data = output_data + (patch_index_start * filter_count);
       
       //TGemmFunctor gemm_functor;
       //gemm_functor(context, m, n, k, im2col_buffer, lda, filter_data, ldb,
                    //chunk_output_data, ldc);
     }
-  }
 };
-
-
-
-
-
-
-
 
 
 
@@ -338,28 +322,44 @@ class Im2ColConvFunctor {
 int main()
 {
     
-    const int depth = 1;
-    const int image_width = 4;
-    const int image_height = 3;
-    const int image_batch_count = 1;
+    const int input_depth   = 1;
+    const int input_width   = 4;
+    const int input_height  = 4;
+    const int input_batches = 1;
     // The image matrix is:
     // |  1 |  2 |  3 |  4 |
     // |  5 |  6 |  7 |  8 |
     // |  9 | 10 | 11 | 12 |
-    const int image_data[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
+    // | 13 | 14 | 15 | 16 |
+    std::vector<int> input_data = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
     
     // The filter matrix is:
     // | 1 | 4 | 7 |
     // | 2 | 5 | 8 |
     // | 3 | 6 | 9 |
-    const int filter_size = 3;
-    const int filter_count = 1;
-    const int filter_data[] = {1, 4, 7, 2, 5, 8, 3, 6, 9};
-   
     
+    const int filter_count  = 1;
+    const int filter_height = 3;
+    const int filter_width  = 3;
+    std::vector<int> filter_data = {1, 4, 7, 2, 5, 8, 3, 6, 9};
+
+    const int stride_rows = 1;
+    const int stride_cols = 1;
+    Padding padding = VALID;
     
-    
-    std::cout << "hello" << std::endl;
+    const int output_height = (input_height-filter_height)/stride_rows+1; 
+    const int output_width = (input_width-filter_width)/stride_cols+1; 
+
+    // output matrix shape should be 9x4    
+        
+    //std::unique_ptr<int[]> output_data(new int[output_height * output_width]);
+    std::vector<int> output_data;
+
+    Im2ColConvFunctor(input_data.data(), input_batches, 
+                            input_height, input_width, input_depth, 
+                            filter_data.data(), filter_height, filter_width, filter_count, stride_rows,
+                            stride_cols, padding, output_data.data(), output_height, output_width); 
+ 
     return 0;
 }
 
